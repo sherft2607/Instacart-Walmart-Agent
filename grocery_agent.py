@@ -8,7 +8,6 @@ from google.genai import errors
 from google.genai.types import GenerateContentConfig
 from playwright.sync_api import sync_playwright
 
-os.environ["GEMINI_API_KEY"] = "your-new-rotated-key-here"
 client = genai.Client()
 
 CDP_URL = "http://localhost:9222"
