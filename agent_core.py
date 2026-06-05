@@ -3,11 +3,15 @@ import re
 import json
 import time
 import hashlib
+import sys
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import errors
 from google.genai.types import GenerateContentConfig
 from playwright.sync_api import sync_playwright
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8')
 
 api_key = os.environ.get("GEMINI_API_KEY")
 env_file = ".env"
@@ -71,9 +75,10 @@ system_instruction = (
     "You turn a recipe into a grocery shopping list for Instacart's Walmart storefront. "
     "List only main ingredients (skip salt, pepper, water, basic spices). Use 'Great Value' "
     "unless a specific brand matters. Substitute niche/specialty items for the closest common "
-    "item Walmart stocks. Prepend 'Fresh' for raw produce only (never eggs/dairy/meat). Only "
-    "include a size when it truly matters (bulk staples, eggs by dozen); leave blank for sauces, "
-    "oils, noodles. Choose a whole-number quantity. "
+    "item Walmart stocks. Prepend 'Fresh' for raw produce only (never eggs/dairy/meat). "
+    "CRITICAL: 'qty' must be the number of STORE PACKAGES to buy (usually 1). "
+    "Do NOT put recipe measurements (like 10 from '10 oz') into 'qty'. Instead, put the measurement into 'size' "
+    "(e.g., qty: 1, size: '10 oz'). Leave 'size' blank for things like sauces or produce where size doesn't matter. "
     'Output ONLY a JSON array of {"query","qty","size"}.'
 )
 
@@ -98,7 +103,7 @@ WORD_NUM = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
             "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
 CONTAINERS = r"(?:cans?|bags?|jars?|boxes?|bottles?|packs?|cartons?|tubs?|bunch(?:es)?|crowns?)"
 
-RE_SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(fl\s*oz|oz|ounces?|lbs?|pounds?)", re.I)
+RE_SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(fl\s*oz|oz|ounces?|lbs?|pounds?|pints?|quarts?|qts?|gallons?|gals?|grams?|g|ml|milliliters?|pt|pts)\b", re.I)
 RE_COUNT = re.compile(r"(\d+)\s*(?:ct|count)\b", re.I)
 
 class GroceryItemSchema(BaseModel):
@@ -115,7 +120,15 @@ def parse_size(text):
     if not m:
         return None
     val, unit = float(m.group(1)), m.group(2).replace(" ", "")
-    return val * 16 if unit in ("lb", "lbs", "pound", "pounds") else val
+    if unit in ("lb", "lbs", "pound", "pounds"):
+        return val * 16
+    if unit in ("pint", "pints", "pt", "pts"):
+        return val * 16
+    if unit in ("quart", "quarts", "qt", "qts"):
+        return val * 32
+    if unit in ("gallon", "gallons", "gal", "gals"):
+        return val * 128
+    return val
 
 def is_fluid(text):
     return "fl oz" in text.lower()
@@ -134,6 +147,12 @@ def fmt_size(v, fluid=False):
 
 def parse_qty(text):
     t = text.lower().strip()
+    
+    # If the text starts with a number followed by a size unit, the qty is likely 1, not that number.
+    m_size = re.match(r"^(\d+(?:\.\d+)?)\s*(?:fl\s*oz|oz|lbs?|pounds?|pints?|quarts?|qts?|gallons?|gals?|grams?|g|ml|milliliters?|pt|pts)\b", t)
+    if m_size:
+        return 1
+
     m = re.match(r"^(\d+)\s+", t)
     if m:
         return int(m.group(1))
@@ -144,19 +163,21 @@ def parse_qty(text):
     return int(m.group(1)) if m else 1
 
 def clean_query(line):
-    q = line
+    q = re.sub(r'(?:\x1b)?\[[0-9;]*m', '', line)
     q = re.sub(r"^\s*\d+\s+", "", q)
     for w in WORD_NUM:
         q = re.sub(rf"^\s*{w}\b\s*", "", q, flags=re.I)
     q = re.sub(rf"\b\d*\s*{CONTAINERS}\s+of\b", "", q, flags=re.I)
     q = re.sub(rf"\b{CONTAINERS}\s+of\b", "", q, flags=re.I)
-    q = re.sub(r"\b\d+(?:\.\d+)?\s*(?:fl\s*oz|oz|ounces?|lbs?|pounds?)\b", "", q, flags=re.I)
+    q = re.sub(r"\b\d+(?:\.\d+)?\s*(?:fl\s*oz|oz|ounces?|lbs?|pounds?|pints?|quarts?|qts?|gallons?|gals?|grams?|g|ml|milliliters?|pt|pts)\b", "", q, flags=re.I)
     q = re.sub(r"\b\d+\s*(?:ct|count)\b", "", q, flags=re.I)
     return re.sub(r"\s{2,}", " ", q).strip(" ,-")
 
 def parse_pasted_line(line):
+    # Strip both raw and literal ANSI escape sequences (e.g. \x1b[1m or [1m)
+    line = re.sub(r'(?:\x1b)?\[[0-9;]*m', '', line)
     size_str = ""
-    m = re.search(r"\d+(?:\.\d+)?\s*(?:fl\s*oz|oz|lbs?|pounds?|ct|count)", line.lower())
+    m = re.search(r"\d+(?:\.\d+)?\s*(?:fl\s*oz|oz|lbs?|pounds?|ct|count|pints?|quarts?|qts?|gallons?|gals?|grams?|g|ml|milliliters?|pt|pts)\b", line.lower())
     if m:
         size_str = m.group(0)
     return {"query": clean_query(line), "qty": parse_qty(line),
@@ -229,7 +250,7 @@ def pick_head(descriptors):
     return descriptors[-1] if descriptors else None
 
 def find_search_box(page):
-    return page.locator('input[aria-label="Search"], input[placeholder^="Search Walmart"]').first
+    return page.locator('input[aria-label="Search"]:visible, input[placeholder^="Search Walmart"]:visible').first
 
 def handle_ripeness(page):
     try:
@@ -309,13 +330,18 @@ def handle_ripeness(page):
 def search_item(page, item):
     handle_ripeness(page)
     box = find_search_box(page)
-    box.click(); box.press("Control+A"); box.press("Delete")
-    box.type(item, delay=45); box.press("Enter")
-    time.sleep(1.0)
+    box.click()
+    box.fill(item)
+    box.press("Enter")
+    
+    # Wait for the search results page to start transitioning and clear old results
+    time.sleep(1.2)
+    
+    # Wait for the new results to finish loading
     try:
         page.wait_for_load_state("networkidle", timeout=3000)
     except Exception:
-        time.sleep(1.0)
+        pass
 
 def product_name_from_label(label):
     m = re.match(r"^Add\s+\d+\s+\S+\s+(.*)$", label)
@@ -431,6 +457,7 @@ def _scrape(c):
     c["size_oz"] = parse_size(src)
     c["fluid"] = is_fluid(src) or any(k in c["name"].lower() for k in FLUID_HINTS)
     c["count"] = parse_count(src)
+    c["is_bestseller"] = "best seller" in txt.lower() or "bestseller" in txt.lower()
     return c
 
 def mark_bulk(c, produce):
@@ -443,6 +470,10 @@ def mark_bulk(c, produce):
 
 def _choose(options, req_oz, req_ct, produce=False):
     pool = options
+    bestsellers = [c for c in pool if c.get("is_bestseller")]
+    if bestsellers:
+        pool = bestsellers
+
     if produce:
         singles = [c for c in pool if not c.get("bulk")]
         if singles:
@@ -483,10 +514,14 @@ def get_substitute_query(query):
     try:
         resp = generate_with_retry(
             model="gemini-2.5-flash",
-            contents=f"Suggest a common storefront alternative ingredient stocked by Walmart for: '{query}'. Output only the plain name of the substitute.",
-            config=GenerateContentConfig(temperature=0.2, max_output_tokens=15),
+            contents=f"Suggest a common storefront alternative ingredient stocked by Walmart for: '{query}'. Do NOT include the brand name (like Great Value). Output only the plain, generic name of the substitute.",
+            config=GenerateContentConfig(temperature=0.2, max_output_tokens=25),
         )
-        return resp.text.strip().strip('"\'')
+        sub = resp.text.strip().strip('"\'-')
+        # If the substitute is too short or is just a brand word, ignore it
+        if len(sub) < 3 or sub.lower() in BRAND_WORDS:
+            return None
+        return sub
     except Exception:
         return None
 
@@ -494,6 +529,8 @@ def find_match(page, query, req_oz, req_ct):
     produce = is_produce(query)
     relevant = _collect(page, query)
     used_q = query
+    
+    # 1. Retry with broadened query (removes brand words like Great Value)
     if not relevant:
         alt = broaden(query)
         if alt.lower() != query.lower():
@@ -501,13 +538,40 @@ def find_match(page, query, req_oz, req_ct):
             search_item(page, alt)
             relevant = _collect(page, alt)
             used_q = alt
+            
+    # 2. Retry with last 2 words of the query (excl. quantities/units)
     if not relevant:
-        alt = get_substitute_query(query)
-        if alt and alt.lower() != query.lower():
-            warn(f"'{query}' not found — AI suggested substitute: '{alt}'")
-            search_item(page, alt)
-            relevant = _collect(page, alt)
-            used_q = alt
+        exclude_words = {"pint", "pints", "pt", "pts", "quart", "quarts", "qt", "qts", "gallon", "gallons", "gal", "gals", "gram", "grams", "g", "ml", "oz", "lbs", "lb", "count", "ct", "pack", "pk"}
+        words = [w for w in used_q.split() if w.lower() not in BRAND_WORDS and not w.isdigit() and w.lower() not in exclude_words]
+        if len(words) > 1:
+            alt2 = " ".join(words[-2:])
+            if alt2.lower() != used_q.lower():
+                info(f"'{used_q}' not found — retrying as '{alt2}'…")
+                search_item(page, alt2)
+                relevant = _collect(page, alt2)
+                used_q = alt2
+                
+    # 3. Retry with last 1 word of the query (excl. quantities/units)
+    if not relevant:
+        exclude_words = {"pint", "pints", "pt", "pts", "quart", "quarts", "qt", "qts", "gallon", "gallons", "gal", "gals", "gram", "grams", "g", "ml", "oz", "lbs", "lb", "count", "ct", "pack", "pk"}
+        words = [w for w in used_q.split() if w.lower() not in BRAND_WORDS and not w.isdigit() and w.lower() not in exclude_words]
+        if len(words) > 0:
+            alt3 = words[-1]
+            if alt3.lower() != used_q.lower():
+                info(f"'{used_q}' not found — retrying as '{alt3}'…")
+                search_item(page, alt3)
+                relevant = _collect(page, alt3)
+                used_q = alt3
+
+    # 4. Final fallback: AI suggested alternative (conserves daily API limits)
+    if not relevant:
+        alt_ai = get_substitute_query(query)
+        if alt_ai and alt_ai.lower() != used_q.lower() and alt_ai.lower() != query.lower():
+            warn(f"'{query}' not found — AI suggested substitute: '{alt_ai}'")
+            search_item(page, alt_ai)
+            relevant = _collect(page, alt_ai)
+            used_q = alt_ai
+
     if not relevant:
         return None, [], used_q
 
@@ -601,11 +665,12 @@ def commit(page, chosen, qty):
         warn(f"{short} — added but not confirmed")
     return added, in_cart
 
-def get_user_input(options, used_q, it):
+def get_user_input(options, used_q, it, chosen=None):
     return input("   ▸ ").strip()
 
 def add_item(page, it):
     qty = it["qty"]
+    explicit_qty = False
     search_item(page, it["query"])
     chosen, options, used_q = find_match(page, it["query"], it["req_oz"], it["req_ct"])
 
@@ -631,7 +696,7 @@ def add_item(page, it):
             except Exception:
                 pass
             try:
-                resp = get_user_input(options, used_q, it)
+                resp = get_user_input(options, used_q, it, chosen)
             except EOFError:
                 resp = ""
             if resp == "":
@@ -643,6 +708,7 @@ def add_item(page, it):
             if m and 1 <= int(m.group(1)) <= len(options):
                 chosen = options[int(m.group(1)) - 1]
                 qty = int(m.group(2))
+                explicit_qty = True
                 break
             if resp.isdigit() and 1 <= int(resp) <= len(options):
                 chosen = options[int(resp) - 1]
@@ -650,6 +716,11 @@ def add_item(page, it):
             used_q = resp
             search_item(page, used_q)
             chosen, options, used_q = find_match(page, used_q, it["req_oz"], it["req_ct"])
+
+    if chosen is not None and not explicit_qty:
+        if it.get("req_oz") and chosen.get("size_oz"):
+            target_oz = it["req_oz"] * it["qty"]
+            qty = max(1, round(target_oz / chosen["size_oz"]))
 
     if chosen is None:
         err("Not carried at Walmart — skipped")
@@ -700,4 +771,65 @@ def filter_pantry(items):
         warn(f"Failed to read pantry list: {e}")
         return items
 
+def propose_item(page, it):
+    qty = it["qty"]
+    search_item(page, it["query"])
+    chosen, options, used_q = find_match(page, it["query"], it["req_oz"], it["req_ct"])
+    
+    if chosen is None:
+        return {"query": it["query"], "name": f"(not carried) {it['query']}", "price": None, "qty": 0, "status": "not-carried", "options": []}
 
+    if it.get("req_oz") and chosen.get("size_oz"):
+        target_oz = it["req_oz"] * it["qty"]
+        qty = max(1, round(target_oz / chosen["size_oz"]))
+
+    status, msgs = compute_status(chosen, it, it["query"])
+    
+    runner_ups = []
+    for o in options[:4]:
+        need = it["qty"]
+        if it.get("req_oz") and o.get("size_oz"):
+            need = max(1, round((it["req_oz"] * it["qty"]) / o["size_oz"]))
+        runner_ups.append({
+            "name": o["name"],
+            "price": o["price"],
+            "qty": need,
+            "is_gv": o.get("is_gv", False),
+            "size_str": fmt_size(o["size_oz"], o.get("fluid", False)) if o.get("size_oz") else ""
+        })
+
+    return {
+        "query": it["query"],
+        "name": chosen["name"], 
+        "price": chosen["price"], 
+        "qty": qty,
+        "status": status,
+        "options": runner_ups
+    }
+
+def commit_exact_item(page, exact_name, qty):
+    info(f"Committing item: {exact_name} (qty {qty})")
+    search_item(page, exact_name)
+    
+    # Wait up to 6 seconds for a button that matches our exact name
+    for attempt in range(12):
+        buttons = page.locator('button[aria-label^="Add"]')
+        for i in range(min(buttons.count(), 15)):
+            b = buttons.nth(i)
+            try:
+                if not b.is_visible(): continue
+                raw = b.get_attribute("aria-label") or ""
+                name = product_name_from_label(raw)
+                if attempt == 0 and i == 0:
+                    info(f"  First button name: {name}")
+                if name.lower() == exact_name.lower() or exact_name.lower() in name.lower() or name.lower() in exact_name.lower():
+                    chosen = {"name": name, "btn": b, "price": None}
+                    added, in_cart = commit(page, chosen, qty)
+                    ok(f"Added {name} to cart")
+                    return {"name": name, "qty": added, "price": None, "status": "added" if in_cart else "not-confirmed"}
+            except Exception as e:
+                err(f"  Err checking button: {e}")
+        time.sleep(0.5)
+        
+    err(f"Failed to find button matching: {exact_name}")
+    return {"name": exact_name, "qty": 0, "price": None, "status": "error"}
