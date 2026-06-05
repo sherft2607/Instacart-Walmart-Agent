@@ -11,13 +11,15 @@ A premium, local web dashboard and automation agent that parses recipes using Ge
 ## ✨ Features
 
 - **Double-Click Startup**: Automatically checks for Chrome debug port conflicts (D5 Render, etc.), binds to port `9223` if empty, starts the local server, and launches Chrome automatically.
-- **Vibrant Web Dashboard**: A high-end glassmorphic web interface containing recipe text areas, parsed list review grids, and live progress terminals.
+- **Neo-Brutalist Web Dashboard**: A bold, high-contrast Neo-Brutalist UI with custom DOM modals, tabbed recipe parsing, and live Playwright execution streams.
 - **Gemini Structured JSON Outputs**: Leverages Google GenAI JSON schema enforcement to parse recipes into structured grocery items with quantity and sizing.
-- **Smart Product Selection & Penalty Scoring**: Scores products using custom word-overlap matching. Unrelated flavored items (like protein shakes or bread) are penalized, prioritizing plain/exact produce matches (like raw bananas).
-- **Interactive Choice Overlays**: If the agent is unsure about a brand swap or sized pack, it pauses and opens an inline selection card modal on your webpage, resuming once you click or type a search query.
-- **Advanced Dialog Handling**: Automatically detects and answers Instacart ripeness popups (choosing "Ripe"), and immediately dismisses irrelevant promos (like "Family Cart" or subscription screens).
+- **Persistent LLM Caching**: API responses are cached in `grocery_cache.json` to reduce costs and latency. Clear the cache directly from the web UI.
+- **Interactive Choice Modals**: If the agent is unsure about a brand swap or sized pack, the script pauses execution and flashes a bold modal on your screen. You can select an option or type a custom manual search query before it resumes.
+- **"Clear Cart" Utility**: A dedicated button in the UI that launches a background thread to rapidly navigate to the Instacart cart and purge all items automatically.
+- **Smart Product Selection**: Scores products using custom word-overlap matching. Unrelated flavored items are penalized, prioritizing plain/exact produce matches.
+- **Advanced Dialog Handling**: Automatically detects and answers Instacart ripeness popups (choosing "Ripe"), and immediately dismisses irrelevant promos.
 - **Session Persistence**: Saves your browser profile state locally, keeping you logged in to Instacart across runs.
-- **Pantry Exclusion Filter**: Automatically filters out staples you already own (e.g. salt, pepper, olive oil) via a custom `pantry.txt`.
+- **Pantry Exclusion Filter**: Automatically filters out staples you already own via the Manage Pantry UI (saved to `pantry.txt`).
 
 ---
 
