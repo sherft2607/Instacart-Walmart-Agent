@@ -180,6 +180,36 @@ def run_playwright():
     
     return jsonify({"status": "started"})
 
+def web_get_user_input(options, used_q, it, chosen=None):
+    # Log an input_required event
+    clean_options = []
+    for o in options:
+        co = o.copy()
+        if "btn" in co:
+            del co["btn"]
+        clean_options.append(co)
+        
+    log_data = {
+        "msg": "Input required",
+        "type": "input_required",
+        "options": clean_options,
+        "query": used_q,
+        "item": it,
+        "chosen_index": options.index(chosen) + 1 if chosen in options else 0
+    }
+    current_session["logs"].put(log_data)
+    
+    # Wait for the user to respond via the /api/input endpoint
+    while True:
+        try:
+            val = current_session["input_queue"].get(timeout=1.0)
+            return val
+        except queue.Empty:
+            if not current_session["running"]:
+                return "s" # skip if aborted
+
+agent_core.USER_INPUT_CALLBACK = web_get_user_input
+
 def playwright_worker(items):
     log_to_web("Starting Playwright automation process...", "info")
     results = []
@@ -215,13 +245,13 @@ def playwright_worker(items):
         for idx, it in enumerate(items, 1):
             log_to_web(f"[{idx}/{len(items)}] Processing: {it['query']} (x{it['qty']})", "step")
             try:
-                res = agent_core.propose_item(page, it)
+                res = agent_core.add_item(page, it)
                 results.append(res)
                 current_session["results"] = results
                 time.sleep(1.5)
             except Exception as e:
                 log_to_web(f"Skipped '{it['query']}' ({type(e).__name__})", "error")
-                results.append({"name": f"(error) {it['query']}", "price": None, "qty": 0, "status": "error"})
+                results.append({"query": it['query'], "name": f"(error) {it['query']}", "price": None, "qty": 0, "status": "error"})
                 current_session["results"] = results
 
     # Summarize & Save Order History
@@ -259,6 +289,87 @@ def playwright_worker(items):
         
     log_to_web("FINISHED", "finished")
     current_session["running"] = False
+
+@app.route("/api/search_options", methods=["POST"])
+def search_options():
+    data = request.json
+    query = data.get("query", "")
+    req_oz = data.get("req_oz", None)
+    req_ct = data.get("req_ct", None)
+    
+    def run_search():
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(agent_core.CDP_URL)
+                page = browser.contexts[0].pages[0] if browser.contexts[0].pages else browser.contexts[0].new_page()
+                agent_core.search_item(page, query)
+                chosen, options, used_q = agent_core.find_match(page, query, req_oz, req_ct)
+                return options
+        except Exception as e:
+            return []
+
+    # Using ThreadPoolExecutor or just run it synchronously since it's just one search
+    # Playwright sync works fine if we just instantiate it
+    options = run_search()
+    return jsonify({"status": "success", "options": options})
+
+@app.route("/api/empty-cart", methods=["POST"])
+def empty_cart():
+    if current_session["running"]:
+        return jsonify({"error": "Another job is already running."}), 400
+    
+    current_session["running"] = True
+    
+    def run_empty():
+        try:
+            log_to_web("Connecting to browser to clear cart...", "info")
+            with sync_playwright() as p:
+                browser = p.chromium.connect_over_cdp(agent_core.CDP_URL)
+                page = browser.contexts[0].pages[0] if browser.contexts[0].pages else browser.contexts[0].new_page()
+                log_to_web("Opening cart...", "step")
+                
+                # Navigate to storefront
+                page.goto("https://www.instacart.com/store/walmart/storefront", timeout=10000)
+                time.sleep(3)
+                
+                # Open cart drawer
+                cart_btn = page.locator('button[aria-label*="cart" i], a[aria-label*="cart" i]').first
+                if cart_btn.count() > 0:
+                    cart_btn.click(force=True)
+                    time.sleep(2)
+                
+                log_to_web("Removing items...", "step")
+                removed = 0
+                for _ in range(50):
+                    # Find remove buttons
+                    btns = page.locator('button[aria-label*="Remove" i], button[aria-label*="Decrease" i], button:has-text("Remove")')
+                    if btns.count() > 0 and btns.first.is_visible():
+                        try:
+                            btns.first.click(force=True, timeout=1000)
+                            time.sleep(0.6)
+                            removed += 1
+                        except:
+                            pass
+                    else:
+                        break
+                        
+                # Close cart
+                close_btn = page.locator('button[aria-label="Close"], button[aria-label="Close modal"]').first
+                if close_btn.count() > 0 and close_btn.is_visible():
+                    close_btn.click(force=True)
+                    
+                log_to_web(f"Finished! Cart cleared. (Clicked remove {removed} times)", "success")
+        except Exception as e:
+            log_to_web(f"Error emptying cart: {e}", "error")
+        finally:
+            log_to_web("FINISHED", "finished")
+            current_session["running"] = False
+            
+    thread = threading.Thread(target=run_empty)
+    thread.daemon = True
+    thread.start()
+    
+    return jsonify({"status": "started"})
 
 @app.route("/api/commit", methods=["POST"])
 def commit_cart():
@@ -890,6 +1001,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
             <button class="tab-btn" id="tab-paste" onclick="switchTab('paste')">Paste Shopping List</button>
             <button class="tab-btn" onclick="openPantry()">Manage Pantry</button>
             <button class="tab-btn" onclick="clearCache()">Clear Cache</button>
+            <button class="tab-btn" style="background-color: var(--accent-red); color: black;" onclick="clearCart()">Clear Cart</button>
         </div>
 
         <div id="recipe-input-area">
@@ -965,6 +1077,18 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
     </div>
 
+    <!-- Custom Dialog Modal -->
+    <div class="pantry-modal" id="custom-dialog">
+        <div class="pantry-content" style="max-width: 400px; text-align: center;">
+            <div class="pantry-title" id="dialog-title" style="margin-bottom: 1rem; font-size: 1.5rem;">Alert</div>
+            <p id="dialog-message" style="margin-bottom: 2rem; font-size: 1.2rem; font-weight: 600;"></p>
+            <div class="btn-row" id="dialog-buttons" style="justify-content: center;">
+                <button class="primary-btn" id="dialog-ok">OK</button>
+                <button class="secondary-btn" id="dialog-cancel" style="display: none;">Cancel</button>
+            </div>
+        </div>
+    </div>
+
     <!-- Prompt User Modal -->
     <div class="pantry-modal" id="prompt-modal">
         <div class="pantry-content" style="max-width: 700px;">
@@ -985,6 +1109,30 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     </div>
 
     <script>
+        function showCustomDialog(message, title = 'Alert', showCancel = false) {
+            return new Promise((resolve) => {
+                const modal = document.getElementById('custom-dialog');
+                document.getElementById('dialog-title').innerText = title;
+                document.getElementById('dialog-message').innerText = message;
+                
+                const btnOk = document.getElementById('dialog-ok');
+                const btnCancel = document.getElementById('dialog-cancel');
+                
+                btnCancel.style.display = showCancel ? 'block' : 'none';
+                modal.style.display = 'flex';
+                
+                btnOk.onclick = () => {
+                    modal.style.display = 'none';
+                    resolve(true);
+                };
+                
+                btnCancel.onclick = () => {
+                    modal.style.display = 'none';
+                    resolve(false);
+                };
+            });
+        }
+
         const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
         
         const playTone = (freq, type, duration, vol=0.1) => {
@@ -1045,7 +1193,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 
         async function parseList() {
             const text = currentMode === 'recipe' ? document.getElementById('recipe-text').value : document.getElementById('paste-text').value;
-            if (!text.trim()) return alert("Please enter some text!");
+            if (!text.trim()) {
+                await showCustomDialog("Please enter some text!");
+                return;
+            }
             
             document.getElementById('items-list-section').style.display = 'block';
             document.getElementById('items-container').innerHTML = '<div class="list-item" style="justify-content:center"><div class="spinner"></div><span style="margin-left:1rem; color: var(--accent-blue);">Parsing items with AI...</span></div>';
@@ -1093,7 +1244,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         async function runAgent() {
-            if (groceryItems.length === 0) return alert("List is empty!");
+            if (groceryItems.length === 0) {
+                await showCustomDialog("List is empty!");
+                return;
+            }
             
             document.getElementById('console-section').style.display = 'block';
             document.getElementById('console-log').innerHTML = '';
@@ -1221,13 +1375,13 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 // Save to global variable for swapping
                 window.proposedCart = data.results;
                 
-                renderProposedCart();
+                renderFinalReceipt();
             }, 1000);
         }
 
-        function renderProposedCart() {
+        function renderFinalReceipt() {
             const container = document.getElementById('receipt-container');
-            container.innerHTML = '';
+            container.innerHTML = '<h2 style="text-align:center; color:#4ADE80; text-shadow: 2px 2px 0px black;">SUCCESS! ITEMS ADDED TO WALMART CART.</h2>';
             
             let grandTotal = 0;
             window.proposedCart.forEach((r, idx) => {
@@ -1245,20 +1399,6 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                 itemDiv.style.marginBottom = '1rem';
                 itemDiv.style.padding = '1rem';
                 itemDiv.style.background = 'white';
-                
-                let optionsHtml = '';
-                if (r.options && r.options.length > 0) {
-                    optionsHtml = `<div style="margin-top:1rem; border-top:2px dashed black; padding-top:1rem; display:none;" id="options-${idx}">
-                        <p style="font-weight:bold; margin-bottom:0.5rem;">Alternative Options:</p>
-                        ${r.options.map(opt => `
-                            <div style="padding:0.5rem; border:2px solid black; margin-bottom:0.5rem; cursor:pointer; background:#F4F4F0;" onclick="swapItem(${idx}, '${opt.name.replace(/'/g, "\\'")}', ${opt.price}, ${opt.qty})">
-                                ${opt.name} - ${opt.qty} × $${opt.price} = <span style="font-weight:bold;">$${(opt.price*opt.qty).toFixed(2)}</span>
-                            </div>
-                        `).join('')}
-                    </div>
-                    <button onclick="document.getElementById('options-${idx}').style.display='block'" style="margin-top:0.5rem; background:#FACC15; border:3px solid black; padding:0.5rem; font-weight:bold; cursor:pointer;">SWAP ITEM</button>
-                    `;
-                }
 
                 const statusClass = {
                     "added": "log-success",
@@ -1301,19 +1441,49 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                             <span class="item-name" style="background:#4ADE80; padding:0.2rem 0.5rem; border:2px solid black; font-weight: 900;">${totalText}</span>
                         </div>
                     </div>
-                    ${optionsHtml}
                 `;
                 container.appendChild(itemDiv);
             });
             
-            const btnHtml = `
-            <div id="commit-btn-div" style="margin-top:2rem; text-align:center;">
-                <button onclick="commitCart()" style="background:#4ADE80; color:black; border:4px solid black; box-shadow: 6px 6px 0px 0px black; padding:1.5rem 3rem; font-size:1.5rem; font-weight:900; cursor:pointer; text-transform:uppercase;">CONFIRM & SEND TO INSTACART</button>
-            </div>
-            `;
-            container.insertAdjacentHTML('beforeend', btnHtml);
+            document.getElementById('receipt-total').innerHTML = `FINAL TOTAL: $${grandTotal.toFixed(2)}`;
+        }
+
+        async function customSearch(index) {
+            const query = document.getElementById('custom-search-' + index).value;
+            if (!query) return;
             
-            document.getElementById('receipt-total').innerHTML = `PROPOSED TOTAL: $${grandTotal.toFixed(2)}`;
+            const btn = document.getElementById('custom-search-btn-' + index);
+            const originalText = btn.innerText;
+            btn.innerText = "SEARCHING...";
+            btn.disabled = true;
+            
+            const r = window.proposedCart[index];
+            try {
+                const response = await fetch('/api/search_options', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ query: query, req_oz: r.req_oz, req_ct: r.req_ct })
+                });
+                const data = await response.json();
+                if (data.status === "success") {
+                    window.proposedCart[index].options = data.options;
+                    // Re-render the options list
+                    const listDiv = document.getElementById('options-list-' + index);
+                    if (data.options.length === 0) {
+                        listDiv.innerHTML = '<p style="color:var(--accent-red); font-weight:bold;">No items found.</p>';
+                    } else {
+                        listDiv.innerHTML = data.options.map(opt => `
+                            <div style="padding:0.5rem; border:2px solid black; margin-bottom:0.5rem; cursor:pointer; background:#F4F4F0;" onclick="swapItem(${index}, '${opt.name.replace(/'/g, "\\'")}', ${opt.price}, ${opt.qty})">
+                                ${opt.name} - ${opt.qty} × $${opt.price} = <span style="font-weight:bold;">$${(opt.price*opt.qty).toFixed(2)}</span>
+                            </div>
+                        `).join('');
+                    }
+                }
+            } catch (e) {
+                console.error(e);
+            }
+            btn.innerText = originalText;
+            btn.disabled = false;
         }
 
         function swapItem(index, newName, newPrice, newQty) {
@@ -1439,9 +1609,57 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         }
 
         async function clearCache() {
-            const response = await fetch('/api/clear-cache', { method: 'POST' });
-            const data = await response.json();
-            alert(data.message);
+            const confirmed = await showCustomDialog('Are you sure you want to clear the grocery API cache?', 'Confirm Clear Cache', true);
+            if (!confirmed) return;
+            const res = await fetch('/api/clear-cache', { method: 'POST' });
+            if (res.ok) await showCustomDialog('Cache cleared successfully!', 'Success');
+        }
+
+        async function clearCart() {
+            const confirmed = await showCustomDialog('Are you sure you want to completely empty your Walmart cart via Playwright? This might take a minute.', 'Empty Cart', true);
+            if (!confirmed) return;
+            
+            const res = await fetch('/api/empty-cart', { method: 'POST' });
+            if (res.ok) {
+                // Show stream UI
+                document.getElementById('items-list-section').style.display = 'none';
+                document.getElementById('cart-summary-section').style.display = 'none';
+                document.getElementById('live-cart-widget').style.display = 'block';
+                document.getElementById('active-item-card').style.display = 'none';
+                document.getElementById('console-log').innerHTML = '';
+                
+                const eventSource = new EventSource('/api/stream');
+                eventSource.onmessage = async function(event) {
+                    const log = JSON.parse(event.data);
+                    if (log.status === 'ping') return;
+                    
+                    if (log.status === 'finished') {
+                        eventSource.close();
+                        setTimeout(async () => {
+                            document.getElementById('live-cart-widget').style.display = 'none';
+                            await showCustomDialog('Cart cleared successfully!', 'Success');
+                        }, 1000);
+                        return;
+                    }
+                    
+                    const entry = document.createElement('div');
+                    entry.className = 'timeline-step step-' + (log.status || 'info');
+                    
+                    const statusIcon = {
+                        "success": "✓",
+                        "warning": "⚠",
+                        "error": "✗",
+                        "step": "🔍"
+                    }[log.status] || "ℹ";
+                    
+                    entry.innerHTML = `<div class="step-icon">${statusIcon}</div><div>${log.message}</div>`;
+                    const consoleLog = document.getElementById('console-log');
+                    consoleLog.appendChild(entry);
+                    consoleLog.scrollTop = consoleLog.scrollHeight;
+                };
+            } else {
+                await showCustomDialog('Failed to start worker, maybe one is already running?', 'Error');
+            }
         }
     </script>
 </body>

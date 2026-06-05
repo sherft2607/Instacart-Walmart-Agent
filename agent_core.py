@@ -665,7 +665,11 @@ def commit(page, chosen, qty):
         warn(f"{short} — added but not confirmed")
     return added, in_cart
 
+USER_INPUT_CALLBACK = None
+
 def get_user_input(options, used_q, it, chosen=None):
+    if USER_INPUT_CALLBACK:
+        return USER_INPUT_CALLBACK(options, used_q, it, chosen)
     return input("   ▸ ").strip()
 
 def add_item(page, it):
@@ -703,7 +707,7 @@ def add_item(page, it):
                 break
             if resp.lower() == "s":
                 info(f"Skipped '{used_q}'.")
-                return {"name": f"(skipped) {it['query']}", "price": None, "qty": 0, "status": "skipped"}
+                return {"query": it['query'], "name": f"(skipped) {it['query']}", "price": None, "qty": 0, "status": "skipped"}
             m = re.match(r"^(\d+)\s*(?:[x*]\s*|\s+)(\d+)$", resp)
             if m and 1 <= int(m.group(1)) <= len(options):
                 chosen = options[int(m.group(1)) - 1]
@@ -724,14 +728,52 @@ def add_item(page, it):
 
     if chosen is None:
         err("Not carried at Walmart — skipped")
-        return {"name": f"(not carried) {it['query']}", "price": None, "qty": 0, "status": "not-carried"}
+        return {"query": it['query'], "name": f"(not carried) {it['query']}", "price": None, "qty": 0, "status": "not-carried"}
 
     status, msgs = compute_status(chosen, it, it["query"])
     for m in msgs:
         warn(m)
     added, in_cart = commit(page, chosen, qty)
-    return {"name": chosen["name"], "price": chosen["price"], "qty": added,
+    return {"query": it['query'], "name": chosen["name"], "price": chosen["price"], "qty": added,
             "status": status if in_cart else "not-confirmed"}
+
+def empty_cart(page):
+    try:
+        print("Emptying cart...")
+        # Open cart drawer
+        cart_btn = page.locator('a[href="/store/walmart/cart"], button[aria-label*="cart" i], a[aria-label*="cart" i]').first
+        if cart_btn.count() > 0:
+            cart_btn.click(force=True)
+            time.sleep(2)
+            
+        # Spam remove and decrease quantity buttons until they are all gone
+        for _ in range(50):
+            dec_btn = page.locator('button[aria-label^="Decrease quantity"], button[aria-label^="Remove item"], button[aria-label^="Remove"]').first
+            if dec_btn.count() > 0 and dec_btn.is_visible():
+                try:
+                    dec_btn.click(force=True)
+                    time.sleep(0.5)
+                except:
+                    pass
+            else:
+                # Try finding text="Remove" inside the drawer
+                remove_text = page.locator('button:has-text("Remove")').first
+                if remove_text.count() > 0 and remove_text.is_visible():
+                    try:
+                        remove_text.click(force=True)
+                        time.sleep(0.5)
+                    except:
+                        pass
+                else:
+                    break
+                    
+        # Close cart
+        close_btn = page.locator('button[aria-label="Close"], button[aria-label="Close modal"]').first
+        if close_btn.count() > 0 and close_btn.is_visible():
+            close_btn.click(force=True)
+        print("Cart emptied!")
+    except Exception as e:
+        print(f"empty_cart failed: {e}")
 
 def read_pasted_list():
     print(f"{C.GRAY}Paste your list (one item per line). Blank line to finish:{C.RESET}")
