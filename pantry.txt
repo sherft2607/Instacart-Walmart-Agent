@@ -1,0 +1,9 @@
+# Add pantry items here (one per line). Lines starting with # are ignored.
+salt
+pepper
+water
+olive oil
+vegetable oil
+sugar
+flour
+butter

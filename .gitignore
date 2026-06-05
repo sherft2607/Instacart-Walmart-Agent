@@ -1,0 +1,6 @@
+.env
+playwright_user_data/
+grocery_cache.json
+order_history.json
+recipe_instructions.md
+__pycache__/
